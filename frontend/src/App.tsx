@@ -28,6 +28,7 @@ import {
   Pencil,
   Plus,
   Printer,
+  RefreshCw,
   Search,
   Settings,
   ShieldOff,
@@ -39,11 +40,8 @@ import {
 /* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/set-state-in-effect */
 import {
   CartesianGrid,
-  Cell,
   Line,
   LineChart,
-  Pie,
-  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -75,6 +73,9 @@ type Assessment = {
   category?: string;
   categoryId?: string;
   targetGroup?: string;
+  assessmentType?: "GENERAL" | "PRE_TEST" | "POST_TEST";
+  startAt?: string | null;
+  endAt?: string | null;
   responseCount?: number;
   publicToken?: string;
   publicUrl?: string;
@@ -93,11 +94,17 @@ type Category = {
   description?: string | null;
   _count?: { assessments: number };
 };
+const toLocalDateTimeInput = (value?: string | null) => {
+  if (!value) return "";
+  const date = new Date(value);
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+    .toISOString()
+    .slice(0, 16);
+};
 const loginSchema = z.object({
   email: z.string().email("กรุณากรอกอีเมลให้ถูกต้อง"),
   password: z.string().min(1, "กรุณากรอกรหัสผ่าน"),
 });
-const colors = ["#174c82", "#35a5c8", "#f0a64a", "#41a782", "#9a72c6"];
 const SUCCESS_TOAST_EVENT = "ict:success-toast";
 
 function showSuccessToast(message: string) {
@@ -338,18 +345,50 @@ function PageHeader({
 function Dashboard() {
   const [summary, setSummary] = useState<any>(null);
   const [charts, setCharts] = useState<any>(null);
+  const [chartPeriod, setChartPeriod] = useState<"daily" | "monthly" | "yearly">("daily");
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [downloadPeriod, setDownloadPeriod] = useState("");
+  const [downloadError, setDownloadError] = useState("");
   const [error, setError] = useState("");
   useEffect(() => {
+    setIsRefreshing(true);
+    setError("");
     Promise.all([api.get("/dashboard/summary"), api.get("/dashboard/charts")])
       .then(([s, c]) => {
         setSummary(s.data.data);
         setCharts(c.data.data);
+        setLastUpdated(new Date());
       })
       .catch(() =>
         setError("ไม่สามารถโหลดข้อมูลได้ ตรวจสอบการเชื่อมต่อ Backend"),
+      )
+      .finally(() => setIsRefreshing(false));
+  }, [refreshKey]);
+  const downloadSummary = async (period: "weekly" | "monthly" | "yearly") => {
+    setDownloadError("");
+    setDownloadPeriod(period);
+    try {
+      const response = await api.get("/reports/summary/export", {
+        params: { period },
+        responseType: "blob",
+      });
+      const url = URL.createObjectURL(response.data);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `assessment-report-${period}.csv`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (error: any) {
+      setDownloadError(
+        error.response?.data?.error?.message || "ดาวน์โหลดรายงานไม่สำเร็จ",
       );
-  }, []);
-  if (error)
+    } finally {
+      setDownloadPeriod("");
+    }
+  };
+  if (error && !summary)
     return (
       <section className="content">
         <PageHeader title="ภาพรวม" />
@@ -363,52 +402,126 @@ function Dashboard() {
         กำลังโหลดข้อมูลจริง…
       </div>
     );
+  const chartData = charts?.[chartPeriod] || [];
+  const chartKey = chartPeriod === "daily" ? "date" : chartPeriod === "monthly" ? "month" : "year";
+  const periodResponses = chartData.reduce(
+    (total: number, bucket: { count: number }) => total + bucket.count,
+    0,
+  );
+  const totalRespondents = summary.responses.total || 0;
+  const internalPercent = totalRespondents
+    ? Math.round((summary.responses.internal / totalRespondents) * 100)
+    : 0;
+  const externalPercent = totalRespondents
+    ? 100 - internalPercent
+    : 0;
+  const topAssessmentMaximum = Math.max(
+    1,
+    ...(summary.topAssessments || []).map((item: Assessment) => item.responseCount || 0),
+  );
   const stats = [
-    [
-      "แบบประเมินทั้งหมด",
-      summary.assessments.total,
-      "รายการ",
-      ClipboardList,
-      "blue",
-    ],
-    [
-      "กำลังเผยแพร่",
-      summary.assessments.published,
-      "รายการ",
-      Activity,
-      "green",
-    ],
-    ["ผู้ตอบทั้งหมด", summary.responses.total, "คน", Users, "purple"],
-    ["เจ้าหน้าที่", summary.staff, "บัญชี", ShieldCheck, "orange"],
+    {
+      label: "คำตอบในช่วงที่เลือก",
+      value: periodResponses,
+      unit: "คำตอบ",
+      Icon: Users,
+      tone: "blue",
+      note: chartPeriod === "daily" ? "30 วันล่าสุด" : chartPeriod === "monthly" ? "12 เดือนล่าสุด" : "5 ปีล่าสุด",
+    },
+    {
+      label: "แบบประเมินทั้งหมด",
+      value: summary.assessments.total,
+      unit: "รายการ",
+      Icon: ClipboardList,
+      tone: "blue",
+      note: "รวมทุกสถานะ",
+    },
+    {
+      label: "เผยแพร่แล้ว",
+      value: summary.assessments.published,
+      unit: "รายการ",
+      Icon: Activity,
+      tone: "green",
+      note: "สถานะปัจจุบัน",
+    },
+    {
+      label: "ฉบับร่าง",
+      value: summary.assessments.draft,
+      unit: "รายการ",
+      Icon: Pencil,
+      tone: "orange",
+      note: "ยังไม่เผยแพร่",
+    },
+    {
+      label: "Pre-test",
+      value: summary.assessments.preTests || 0,
+      unit: "รายการ",
+      Icon: ShieldCheck,
+      tone: "purple",
+      note: "แบบทดสอบก่อนเรียน",
+    },
+    {
+      label: "Post-test",
+      value: summary.assessments.postTests || 0,
+      unit: "รายการ",
+      Icon: ShieldCheck,
+      tone: "blue",
+      note: "แบบทดสอบหลังเรียน",
+    },
   ];
   return (
     <section className="content">
       <PageHeader
         eyebrow="ศูนย์ ICT ขอนแก่น"
         title="ภาพรวมระบบ"
-        subtitle="ติดตามสถานะแบบประเมินและการตอบกลับจากฐานข้อมูลจริง"
+        subtitle={`ข้อมูลตามสิทธิ์บัญชี${lastUpdated ? ` · อัปเดตล่าสุด ${lastUpdated.toLocaleString("th-TH")}` : ""}`}
         action={
-          <Link className="button primary" to="/assessments/new">
-            <Plus size={17} />
-            สร้างแบบประเมิน
-          </Link>
+          <div className="dashboard-header-actions">
+            <div className="dashboard-period-switch" aria-label="ช่วงเวลาของกราฟ">
+              {([
+                ["daily", "30 วัน"],
+                ["monthly", "12 เดือน"],
+                ["yearly", "5 ปี"],
+              ] as const).map(([period, label]) => (
+                <button
+                  key={period}
+                  type="button"
+                  className={chartPeriod === period ? "active" : ""}
+                  aria-pressed={chartPeriod === period}
+                  onClick={() => setChartPeriod(period)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button
+              className="button outline"
+              disabled={isRefreshing}
+              onClick={() => setRefreshKey((key) => key + 1)}
+            >
+              <RefreshCw size={16} className={isRefreshing ? "spin" : ""} />
+              รีเฟรช
+            </button>
+            <Link className="button primary" to="/assessments/new">
+              <Plus size={17} />
+              สร้างแบบประเมิน
+            </Link>
+          </div>
         }
       />
-      <div className="stat-grid">
-        {stats.map(([label, value, unit, Icon, tone]: any) => (
+      {error && <div className="alert error dashboard-alert">{error}</div>}
+      <div className="stat-grid dashboard-stat-grid">
+        {stats.map(({ label, value, unit, Icon, tone, note }) => (
           <div className="stat-card" key={label}>
             <div className={`stat-icon ${tone}`}>
               <Icon size={19} />
             </div>
             <div className="stat-title">{label}</div>
             <div className="stat-value">
-              {value}
+              {Number(value).toLocaleString("th-TH")}
               <small>{unit}</small>
             </div>
-            <div className="stat-foot">
-              <span className="dot" />
-              อัปเดตจากฐานข้อมูล
-            </div>
+            <div className="stat-foot">{note}</div>
           </div>
         ))}
       </div>
@@ -417,37 +530,53 @@ function Dashboard() {
           <div className="panel-head">
             <div>
               <h2>แนวโน้มคำตอบ</h2>
-              <p>จำนวนผู้ตอบรายวัน · 30 วันล่าสุด</p>
+              <p>
+                แสดง {periodResponses.toLocaleString()} คำตอบ · {chartPeriod === "daily" ? "30 วันล่าสุด" : chartPeriod === "monthly" ? "12 เดือนล่าสุด" : "5 ปีล่าสุด"}
+              </p>
             </div>
-            <span className="tag">LIVE DATA</span>
           </div>
-          <div className="chart">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={charts?.daily || []}>
-                <CartesianGrid stroke="#edf1f5" vertical={false} />
-                <XAxis
-                  dataKey="date"
-                  tickLine={false}
-                  axisLine={false}
-                  tick={{ fontSize: 13, fill: "#8592a3" }}
-                />
-                <YAxis
-                  allowDecimals={false}
-                  tickLine={false}
-                  axisLine={false}
-                  tick={{ fontSize: 13, fill: "#8592a3" }}
-                />
-                <Tooltip />
-                <Line
-                  type="monotone"
-                  dataKey="count"
-                  stroke="#2876b8"
-                  strokeWidth={3}
-                  dot={{ r: 3, fill: "#2876b8" }}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
+          {periodResponses ? (
+            <div className="chart">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={chartData}>
+                  <CartesianGrid stroke="#edf1f5" vertical={false} />
+                  <XAxis
+                    dataKey={chartKey}
+                    interval={chartPeriod === "daily" ? 4 : 0}
+                    tickFormatter={(value: string) =>
+                      chartPeriod === "daily"
+                        ? value.slice(5)
+                        : chartPeriod === "monthly"
+                          ? value.slice(2)
+                          : value
+                    }
+                    tickLine={false}
+                    axisLine={false}
+                    tick={{ fontSize: 12, fill: "#718292" }}
+                  />
+                  <YAxis
+                    allowDecimals={false}
+                    tickLine={false}
+                    axisLine={false}
+                    tick={{ fontSize: 12, fill: "#718292" }}
+                  />
+                  <Tooltip />
+                  <Line
+                    type="monotone"
+                    dataKey="count"
+                    stroke="#2876b8"
+                    strokeWidth={3}
+                    dot={{ r: 3, fill: "#2876b8" }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <div className="dashboard-empty-chart">
+              <b>ยังไม่มีคำตอบในช่วงเวลานี้</b>
+              <span>เมื่อมีผู้ตอบแบบประเมิน แนวโน้มจะแสดงที่นี่</span>
+            </div>
+          )}
         </div>
         <div className="panel">
           <div className="panel-head">
@@ -456,50 +585,76 @@ function Dashboard() {
               <p>สัดส่วนการตอบทั้งหมด</p>
             </div>
           </div>
-          <div className="pie-wrap">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie
-                  data={[
-                    {
-                      name: "ภายใน",
-                      value: charts?.respondents?.internal || 0,
-                    },
-                    {
-                      name: "ภายนอก",
-                      value: charts?.respondents?.external || 0,
-                    },
-                  ]}
-                  dataKey="value"
-                  innerRadius={65}
-                  outerRadius={92}
-                  paddingAngle={5}
-                >
-                  {[0, 1].map((i) => (
-                    <Cell key={i} fill={colors[i]} />
-                  ))}
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
-            <div className="pie-center">
-              <b>{summary.responses.total}</b>
-              <small>คำตอบ</small>
+          <div className="respondent-summary">
+            <div className="respondent-total">
+              <b>{totalRespondents.toLocaleString("th-TH")}</b>
+              <span>คำตอบสะสมทั้งหมด</span>
             </div>
-          </div>
-          <div className="legend">
-            <span>
-              <i style={{ background: colors[0] }} />
-              ภายใน <b>{summary.responses.internal}</b>
-            </span>
-            <span>
-              <i style={{ background: colors[1] }} />
-              ภายนอก <b>{summary.responses.external}</b>
-            </span>
+            <div
+              className="respondent-stacked"
+              role="img"
+              aria-label={`ผู้ตอบภายใน ${internalPercent} เปอร์เซ็นต์ ผู้ตอบภายนอก ${externalPercent} เปอร์เซ็นต์`}
+            >
+              <span className="respondent-internal" style={{ width: `${internalPercent}%` }} />
+              <span className="respondent-external" style={{ width: `${externalPercent}%` }} />
+            </div>
+            <div className="respondent-legend">
+              <div>
+                <i className="respondent-internal" />
+                <span>ผู้ตอบภายใน</span>
+                <b>{summary.responses.internal.toLocaleString("th-TH")}</b>
+                <small>{internalPercent}%</small>
+              </div>
+              <div>
+                <i className="respondent-external" />
+                <span>ผู้ตอบภายนอก</span>
+                <b>{summary.responses.external.toLocaleString("th-TH")}</b>
+                <small>{externalPercent}%</small>
+              </div>
+            </div>
           </div>
         </div>
       </div>
-      <div className="panel recent">
+      <div className="dashboard-quick-section">
+        <div className="dashboard-section-heading">
+          <div>
+            <h2>ทางลัดและดาวน์โหลด</h2>
+            <p>เริ่มงานหลักหรือส่งออกรายงานภาพรวมตามช่วงเวลา</p>
+          </div>
+        </div>
+        <div className="dashboard-quick-grid">
+          <Link className="dashboard-quick-card" to="/assessments/new">
+            <span className="quick-icon green"><Plus size={18} /></span>
+            <span><b>สร้างแบบประเมิน</b><small>เริ่มแบบประเมินใหม่</small></span>
+          </Link>
+          <Link className="dashboard-quick-card" to="/assessments">
+            <span className="quick-icon blue"><ClipboardList size={18} /></span>
+            <span><b>จัดการแบบประเมิน</b><small>ดูสถานะและคำตอบ</small></span>
+          </Link>
+          <Link className="dashboard-quick-card" to="/reports">
+            <span className="quick-icon purple"><BarChart3 size={18} /></span>
+            <span><b>รายงานผล</b><small>ดูผลรายข้อและ Pre/Post</small></span>
+          </Link>
+          {([
+            ["weekly", "รายสัปดาห์", "สัปดาห์ปัจจุบัน"],
+            ["monthly", "รายเดือน", "เดือนปัจจุบัน"],
+            ["yearly", "รายปี", "ปีปัจจุบัน"],
+          ] as const).map(([period, label, note]) => (
+            <button
+              className="dashboard-quick-card"
+              key={period}
+              disabled={Boolean(downloadPeriod)}
+              onClick={() => void downloadSummary(period)}
+            >
+              <span className="quick-icon orange"><ArrowDownToLine size={18} /></span>
+              <span><b>{downloadPeriod === period ? "กำลังสร้างไฟล์…" : `ดาวน์โหลด ${label}`}</b><small>{note} · CSV</small></span>
+            </button>
+          ))}
+        </div>
+        {downloadError && <div className="alert error">{downloadError}</div>}
+      </div>
+      <div className="dashboard-bottom-grid">
+      <div className="panel recent dashboard-recent">
         <div className="panel-head">
           <div>
             <h2>แบบประเมินล่าสุด</h2>
@@ -513,7 +668,7 @@ function Dashboard() {
               <thead>
                 <tr>
                   <th>ชื่อแบบประเมิน</th>
-                  <th>หมวดหมู่</th>
+                  <th>ประเภท</th>
                   <th>สถานะ</th>
                   <th>คำตอบ</th>
                 </tr>
@@ -522,13 +677,15 @@ function Dashboard() {
                 {summary.recent.map((a: Assessment) => (
                   <tr key={a.id}>
                     <td>
-                      <b>{a.title}</b>
+                      <Link className="table-link" to={`/assessments/${a.id}`}>
+                        {a.title}
+                      </Link>
                     </td>
-                    <td>{a.category || "—"}</td>
+                    <td>{a.assessmentType === "PRE_TEST" ? "Pre-test" : a.assessmentType === "POST_TEST" ? "Post-test" : "ทั่วไป"}</td>
                     <td>
                       <Status value={a.status} />
                     </td>
-                    <td>{a.responseCount || 0}</td>
+                    <td>{Number(a.responseCount || 0).toLocaleString("th-TH")}</td>
                   </tr>
                 ))}
               </tbody>
@@ -540,6 +697,32 @@ function Dashboard() {
             text="สร้างแบบประเมินแรกเพื่อเริ่มเก็บข้อมูล"
           />
         )}
+      </div>
+      <div className="panel dashboard-top-five">
+        <div className="panel-head">
+          <div>
+            <h2>แบบประเมินที่มีคำตอบสูงสุด</h2>
+            <p>จัดอันดับจากจำนวนคำตอบทั้งหมด</p>
+          </div>
+          <span className="dashboard-rank-label">Top 5</span>
+        </div>
+        <div className="top-assessment-list">
+          {summary.topAssessments?.length ? summary.topAssessments.map((a: Assessment, index: number) => (
+            <Link className="top-assessment-row" to={`/assessments/${a.id}`} key={a.id}>
+              <span className="top-assessment-rank">{index + 1}</span>
+              <span className="top-assessment-content">
+                <span className="top-assessment-name">{a.title}</span>
+                <span className="top-assessment-track">
+                  <i style={{ width: `${((a.responseCount || 0) / topAssessmentMaximum) * 100}%` }} />
+                </span>
+              </span>
+              <b className="top-assessment-count">{Number(a.responseCount || 0).toLocaleString("th-TH")}</b>
+            </Link>
+          )) : (
+            <Empty title="ยังไม่มีคำตอบ" text="อันดับจะแสดงเมื่อมีผู้ตอบแบบประเมิน" />
+          )}
+        </div>
+      </div>
       </div>
     </section>
   );
@@ -631,7 +814,7 @@ function AssessmentList() {
                     {a.title}
                   </Link>
                   <small className="table-sub">
-                    กลุ่มเป้าหมาย {a.targetGroup}
+                    กลุ่มเป้าหมาย {a.targetGroup} · {a.assessmentType === "PRE_TEST" ? "Pre-test" : a.assessmentType === "POST_TEST" ? "Post-test" : "ทั่วไป"}
                   </small>
                 </td>
                 <td>{a.category || "—"}</td>
@@ -714,7 +897,6 @@ function AssessmentList() {
 function AssessmentEditor() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const [categories, setCategories] = useState<Category[]>([]);
   const [assessment, setAssessment] = useState<Assessment | null>(null);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [message, setMessage] = useState("");
@@ -725,7 +907,6 @@ function AssessmentEditor() {
     (assessment.status !== "DRAFT" || (assessment.responseCount || 0) > 0),
   );
   useEffect(() => {
-    api.get("/categories").then((r) => setCategories(r.data.data));
     if (id)
       api
         .get(`/assessments/${id}`)
@@ -763,8 +944,14 @@ function AssessmentEditor() {
     const body = {
       title: fd.get("title"),
       description: fd.get("description"),
-      categoryId: fd.get("categoryId"),
       targetGroup: fd.get("targetGroup"),
+      assessmentType: fd.get("assessmentType"),
+      startAt: fd.get("startAt")
+        ? new Date(String(fd.get("startAt"))).toISOString()
+        : null,
+      endAt: fd.get("endAt")
+        ? new Date(String(fd.get("endAt"))).toISOString()
+        : null,
     };
     try {
       const r = id
@@ -787,7 +974,14 @@ function AssessmentEditor() {
       .split("\n")
       .map((x) => x.trim())
       .filter(Boolean)
-      .map((optionText, index) => ({ optionText, score: index + 1 }));
+      .map((optionText, index) => {
+        const scores = String(fd.get("scores") || "")
+          .split("\n")
+          .map((score) => score.trim())
+          .filter(Boolean);
+        const score = scores[index] == null ? index + 1 : Number(scores[index]);
+        return { optionText, score: Number.isFinite(score) ? score : 0 };
+      });
     try {
       const r = await api.post(`/assessments/${assessment.id}/questions`, {
         questionText: fd.get("questionText"),
@@ -917,21 +1111,15 @@ function AssessmentEditor() {
               />
             </label>
             <label>
-              หมวดหมู่
+              ประเภทแบบประเมิน
               <select
-                name="categoryId"
-                required
+                name="assessmentType"
                 disabled={isLocked}
-                defaultValue={assessment?.categoryId || ""}
+                defaultValue={assessment?.assessmentType || "GENERAL"}
               >
-                <option value="" disabled>
-                  เลือกหมวดหมู่
-                </option>
-                {categories.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
+                <option value="GENERAL">แบบประเมินทั่วไป</option>
+                <option value="PRE_TEST">Pre-test</option>
+                <option value="POST_TEST">Post-test</option>
               </select>
             </label>
             <label>
@@ -953,6 +1141,24 @@ function AssessmentEditor() {
                 rows={3}
                 disabled={isLocked}
                 defaultValue={(assessment as any)?.description || ""}
+              />
+            </label>
+            <label>
+              เวลาเริ่มเปิดแบบประเมิน
+              <input
+                name="startAt"
+                type="datetime-local"
+                disabled={isLocked}
+                defaultValue={toLocalDateTimeInput(assessment?.startAt)}
+              />
+            </label>
+            <label>
+              เวลาปิดแบบประเมิน
+              <input
+                name="endAt"
+                type="datetime-local"
+                disabled={isLocked}
+                defaultValue={toLocalDateTimeInput(assessment?.endAt)}
               />
             </label>
             <div className="span-2">
@@ -1001,6 +1207,15 @@ function AssessmentEditor() {
                     name="options"
                     rows={3}
                     placeholder={"ดีมาก\nปานกลาง\nน้อย"}
+                  />
+                </label>
+                <label className="span-2">
+                  คะแนนของแต่ละตัวเลือก
+                  <small>(ใส่คะแนนหนึ่งค่าต่อบรรทัด ให้ตรงลำดับตัวเลือก; เว้นว่างจะใช้ 1, 2, 3…)</small>
+                  <textarea
+                    name="scores"
+                    rows={2}
+                    placeholder={"0\n1\n0"}
                   />
                 </label>
                 <button className="button secondary">
@@ -1862,6 +2077,11 @@ function CategoriesPage({ user }: { user: User }) {
 function ReportsPage() {
   const [items, setItems] = useState<Assessment[]>([]);
   const [selected, setSelected] = useState("");
+  const [preTestId, setPreTestId] = useState("");
+  const [postTestId, setPostTestId] = useState("");
+  const [comparison, setComparison] = useState<any>();
+  const [comparisonError, setComparisonError] = useState("");
+  const [isComparing, setIsComparing] = useState(false);
   const [data, setData] = useState<any>();
   const [reportError, setReportError] = useState("");
   const [isLoadingReport, setIsLoadingReport] = useState(false);
@@ -1870,8 +2090,28 @@ function ReportsPage() {
   );
 
   useEffect(() => {
-    api.get("/assessments").then((r) => setItems(r.data.data.items));
+    api
+      .get("/assessments", { params: { pageSize: 100 } })
+      .then((r) => setItems(r.data.data.items));
   }, []);
+
+  async function comparePrePost() {
+    setComparisonError("");
+    setIsComparing(true);
+    try {
+      const response = await api.get("/reports/pre-post", {
+        params: { preTestId, postTestId },
+      });
+      setComparison(response.data.data);
+    } catch (error: any) {
+      setComparisonError(
+        error.response?.data?.error?.message || "โหลดรายงานเปรียบเทียบไม่สำเร็จ",
+      );
+      setComparison(undefined);
+    } finally {
+      setIsComparing(false);
+    }
+  }
 
   useEffect(() => {
     setData(undefined);
@@ -1961,6 +2201,63 @@ function ReportsPage() {
           ) : undefined
         }
       />
+      <div className="panel form-panel report-panel pre-post-panel">
+        <div className="panel-head">
+          <div>
+            <h2>เปรียบเทียบผล Pre-test / Post-test</h2>
+            <p>จับคู่ผู้ตอบด้วยอีเมล หรือชื่อที่กรอกตรงกัน และคำนวณจากข้อที่มีคะแนน</p>
+          </div>
+        </div>
+        <div className="report-controls pre-post-controls">
+          <label>
+            Pre-test
+            <select value={preTestId} onChange={(event) => setPreTestId(event.target.value)}>
+              <option value="">เลือกแบบทดสอบก่อนเรียน</option>
+              {items.filter((item) => item.assessmentType === "PRE_TEST").map((item) => (
+                <option key={item.id} value={item.id}>{item.title}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Post-test
+            <select value={postTestId} onChange={(event) => setPostTestId(event.target.value)}>
+              <option value="">เลือกแบบทดสอบหลังเรียน</option>
+              {items.filter((item) => item.assessmentType === "POST_TEST").map((item) => (
+                <option key={item.id} value={item.id}>{item.title}</option>
+              ))}
+            </select>
+          </label>
+          <button
+            className="button primary"
+            disabled={!preTestId || !postTestId || isComparing}
+            onClick={() => void comparePrePost()}
+          >
+            {isComparing ? "กำลังคำนวณ…" : "เปรียบเทียบผล"}
+          </button>
+        </div>
+        {comparisonError && <div className="alert error">{comparisonError}</div>}
+        {comparison && (
+          <div className="pre-post-results">
+            <div className="pre-post-score">
+              <span>{comparison.preTest.title}</span>
+              <b>{comparison.preTest.averageScore == null ? "—" : comparison.preTest.averageScore.toFixed(2)}</b>
+              <small>เฉลี่ยจากผู้ตอบที่มีคะแนน {comparison.preTest.scoredResponses}/{comparison.preTest.responses} คน</small>
+            </div>
+            <div className="pre-post-delta">
+              <span>เปลี่ยนแปลงเฉลี่ย</span>
+              <b className={comparison.averageChange > 0 ? "positive" : comparison.averageChange < 0 ? "negative" : ""}>
+                {comparison.averageChange == null ? "ไม่มีข้อมูลผู้ตอบที่จับคู่ได้" : `${comparison.averageChange > 0 ? "+" : ""}${comparison.averageChange.toFixed(2)}`}
+              </b>
+              <small>จับคู่ได้ {comparison.pairedRespondents} คน · คะแนนเพิ่ม {comparison.improvedRespondents} คน</small>
+            </div>
+            <div className="pre-post-score">
+              <span>{comparison.postTest.title}</span>
+              <b>{comparison.postTest.averageScore == null ? "—" : comparison.postTest.averageScore.toFixed(2)}</b>
+              <small>เฉลี่ยจากผู้ตอบที่มีคะแนน {comparison.postTest.scoredResponses}/{comparison.postTest.responses} คน</small>
+            </div>
+          </div>
+        )}
+      </div>
       <div className="panel form-panel report-panel">
         <div className="report-controls">
           <label>
@@ -1986,7 +2283,9 @@ function ReportsPage() {
         )}
         {data && (
           <div className="report-print-area">
-            <h2 className="report-print-title">{data.assessment.title}</h2>
+            <h2 className="report-print-title">
+              {data.assessment.title} · {data.assessment.assessmentType === "PRE_TEST" ? "Pre-test" : data.assessment.assessmentType === "POST_TEST" ? "Post-test" : "แบบประเมินทั่วไป"}
+            </h2>
             <div className="stat-grid report-stat-grid">
               <div className="stat-card">
                 <div className="stat-icon blue">
@@ -2025,15 +2324,35 @@ function ReportsPage() {
                 <div className="stat-icon orange">
                   <Activity size={18} />
                 </div>
-                <div className="stat-title">คะแนนเฉลี่ย</div>
-                <div className="stat-value">
-                  {data.summary.average == null
-                    ? "—"
-                    : data.summary.average.toFixed(2)}
-                  <small>/ 5</small>
+                <div className="stat-title">
+                  {data.assessment.assessmentType === "PRE_TEST" || data.assessment.assessmentType === "POST_TEST" ? "คะแนนเฉลี่ยแบบทดสอบ" : "คะแนนเฉลี่ย"}
                 </div>
-                <div className="stat-foot">คำนวณจากคำถามแบบให้คะแนน</div>
+                <div className="stat-value">
+                  {(data.assessment.assessmentType === "PRE_TEST" || data.assessment.assessmentType === "POST_TEST" ? data.summary.averageScore : data.summary.average) == null
+                    ? "—"
+                    : (data.assessment.assessmentType === "PRE_TEST" || data.assessment.assessmentType === "POST_TEST" ? data.summary.averageScore : data.summary.average).toFixed(2)}
+                  <small>{data.assessment.assessmentType === "PRE_TEST" || data.assessment.assessmentType === "POST_TEST" ? ` · ${data.summary.scoredResponses} คน` : "คำตอบตัวเลข"}</small>
+                </div>
+                <div className="stat-foot">
+                  {data.assessment.assessmentType === "PRE_TEST" || data.assessment.assessmentType === "POST_TEST" ? "เฉลี่ยคะแนนจากคำถามตัวเลขและตัวเลือกที่กำหนดคะแนน" : "คำนวณจากคำถามแบบให้คะแนน"}
+                </div>
               </div>
+            </div>
+            <div className="report-timeline">
+              <h3>จำนวนคำตอบตามวันที่</h3>
+              {data.timeline.length ? (
+                <div className="chart">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={data.timeline}>
+                      <CartesianGrid stroke="#edf1f5" vertical={false} />
+                      <XAxis dataKey="date" tickLine={false} axisLine={false} />
+                      <YAxis allowDecimals={false} tickLine={false} axisLine={false} />
+                      <Tooltip />
+                      <Line type="monotone" dataKey="count" stroke="#2876b8" strokeWidth={3} dot={{ r: 3 }} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : <p className="muted">ยังไม่มีคำตอบในแบบประเมินนี้</p>}
             </div>
             <div className="table-wrap report-question-table">
               <table>
@@ -2057,11 +2376,17 @@ function ReportsPage() {
                             : question.average.toFixed(2)}
                         </td>
                         <td>
-                          {Object.entries(question.options)
-                            .map(([key, value]) => `${key}: ${value}`)
-                            .join(" · ") ||
-                            question.texts.slice(0, 3).join(" · ") ||
-                            "—"}
+                          {Object.entries(question.options).length ? (
+                            <div className="answer-distribution">
+                              {Object.entries(question.options).map(([label, count]) => (
+                                <div className="answer-distribution-row" key={label}>
+                                  <span>{label}</span>
+                                  <progress max={question.answerCount || 1} value={Number(count)} />
+                                  <b>{Number(count)}</b>
+                                </div>
+                              ))}
+                            </div>
+                          ) : question.texts.slice(0, 3).join(" · ") || "—"}
                         </td>
                       </tr>
                     ))
@@ -2074,6 +2399,37 @@ function ReportsPage() {
                   )}
                 </tbody>
               </table>
+            </div>
+            <div className="report-response-list">
+              <h3>คำตอบรายบุคคล</h3>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>ส่งเมื่อ</th>
+                      <th>ประเภทผู้ตอบ</th>
+                      <th>คะแนน</th>
+                      <th>คำตอบ</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.responses.length ? data.responses.slice(0, 100).map((response: any) => (
+                      <tr key={response.id}>
+                        <td>{new Date(response.submittedAt).toLocaleString("th-TH")}</td>
+                        <td>{response.type === "INTERNAL" ? "ภายใน" : "ภายนอก"}</td>
+                        <td>{response.score == null ? "—" : response.score.toFixed(2)}</td>
+                        <td>{response.answers.map((answer: any, index: number) => {
+                          const value = answer.text || (answer.number != null ? String(answer.number) : answer.options.join(", ") || "—");
+                          return <div key={`${response.id}-${index}`}><b>{answer.question}:</b> {value}</div>;
+                        })}</td>
+                      </tr>
+                    )) : (
+                      <tr><td colSpan={4} className="users-state-cell">ยังไม่มีคำตอบ</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              {data.responses.length > 100 && <small className="muted">แสดง 100 คำตอบล่าสุดจากทั้งหมด {data.responses.length} รายการ</small>}
             </div>
           </div>
         )}

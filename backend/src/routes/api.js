@@ -37,10 +37,11 @@ const userInput = z.object({
 });
 const assessmentInput = z
   .object({
-    categoryId: z.string().uuid(),
+    categoryId: z.string().uuid().optional().nullable(),
     title: z.string().trim().min(1).max(255),
     description: z.string().optional().nullable(),
     targetGroup: z.enum(["INTERNAL", "EXTERNAL", "BOTH"]),
+    assessmentType: z.enum(["GENERAL", "PRE_TEST", "POST_TEST"]).default("GENERAL"),
     startAt: z.string().datetime().optional().nullable(),
     endAt: z.string().datetime().optional().nullable(),
   })
@@ -73,6 +74,7 @@ const serializedAssessment = (a) => ({
   id: a.id,
   categoryId: a.category_id,
   category: a.assessment_categories?.name,
+  assessmentType: a.assessment_type || "GENERAL",
   creator: a.users?.full_name,
   title: a.title,
   description: a.description,
@@ -474,11 +476,12 @@ router.post(
       serializedAssessment(
         await prisma.assessments.create({
           data: {
-            category_id: i.categoryId,
+            category_id: null,
             created_by: req.user.id,
             title: i.title,
             description: i.description || null,
             target_group: i.targetGroup,
+            assessment_type: i.assessmentType,
             start_at: i.startAt ? new Date(i.startAt) : null,
             end_at: i.endAt ? new Date(i.endAt) : null,
           },
@@ -530,10 +533,11 @@ router.put(
     const updated = await prisma.assessments.update({
       where: { id: a.id },
       data: {
-        category_id: i.categoryId,
+        category_id: null,
         title: i.title,
         description: i.description || null,
         target_group: i.targetGroup,
+        assessment_type: i.assessmentType,
         start_at: i.startAt ? new Date(i.startAt) : null,
         end_at: i.endAt ? new Date(i.endAt) : null,
       },
@@ -581,9 +585,7 @@ router.post(
       throw new HttpError(403, "ไม่มีสิทธิ์เผยแพร่");
     if (!a.questions.length) throw new HttpError(400, "เพิ่มคำถามก่อนเผยแพร่");
     const now = new Date();
-    if (a.start_at && now < a.start_at)
-      throw new HttpError(400, "ยังไม่ถึงวันเริ่มต้น");
-    if (a.end_at && now > a.end_at)
+    if (a.end_at && now >= a.end_at)
       throw new HttpError(400, "แบบประเมินเลยวันสิ้นสุดแล้ว");
     const updated = await prisma.assessments.update({
       where: { id: a.id },
@@ -628,11 +630,12 @@ router.post(
       throw new HttpError(403, "ไม่มีสิทธิ์เข้าถึง");
     const clone = await prisma.assessments.create({
       data: {
-        category_id: a.category_id,
+        category_id: null,
         created_by: req.user.id,
         title: `${a.title} (สำเนา)`,
         description: a.description,
         target_group: a.target_group,
+        assessment_type: a.assessment_type,
         questions: {
           create: a.questions.map((q) => ({
             question_text: q.question_text,
@@ -822,7 +825,7 @@ router.get(
       !a ||
       a.status !== "PUBLISHED" ||
       (a.start_at && now < a.start_at) ||
-      (a.end_at && now > a.end_at)
+      (a.end_at && now >= a.end_at)
     )
       throw new HttpError(404, "แบบประเมินนี้ไม่เปิดรับคำตอบ");
     ok(res, {
@@ -830,7 +833,8 @@ router.get(
       title: a.title,
       description: a.description,
       targetGroup: a.target_group,
-      category: a.assessment_categories.name,
+      assessmentType: a.assessment_type || "GENERAL",
+      category: a.assessment_categories?.name,
       questions: a.questions.map((q) => ({
         id: q.id,
         text: q.question_text,
@@ -861,7 +865,7 @@ router.post(
       !a ||
       a.status !== "PUBLISHED" ||
       (a.start_at && now < a.start_at) ||
-      (a.end_at && now > a.end_at)
+      (a.end_at && now >= a.end_at)
     )
       throw new HttpError(404, "แบบประเมินนี้ไม่เปิดรับคำตอบ");
     const body = parse(
@@ -973,8 +977,9 @@ router.get(
       responses,
       internal,
       external,
-      staff,
-      recent,
+      preTests,
+      postTests,
+      assessmentsWithCounts,
     ] = await Promise.all([
       prisma.assessments.count({ where: scope }),
       prisma.assessments.count({ where: { ...scope, status: "PUBLISHED" } }),
@@ -987,24 +992,28 @@ router.get(
       prisma.responses.count({
         where: { respondent_type: "EXTERNAL", assessments: scope },
       }),
-      prisma.users.count({
-        where: { is_active: true, roles: { name: "STAFF" } },
+      prisma.assessments.count({
+        where: { ...scope, assessment_type: "PRE_TEST" },
+      }),
+      prisma.assessments.count({
+        where: { ...scope, assessment_type: "POST_TEST" },
       }),
       prisma.assessments.findMany({
         where: scope,
-        include: {
-          assessment_categories: true,
-          _count: { select: { responses: true } },
-        },
+        include: { assessment_categories: true, _count: { select: { responses: true } } },
         orderBy: { created_at: "desc" },
-        take: 5,
       }),
     ]);
+    const recent = assessmentsWithCounts.slice(0, 5);
+    const topAssessments = [...assessmentsWithCounts]
+      .filter((assessment) => assessment._count.responses > 0)
+      .sort((left, right) => right._count.responses - left._count.responses)
+      .slice(0, 5);
     ok(res, {
-      assessments: { total, published, draft, closed },
+      assessments: { total, published, draft, closed, preTests, postTests },
       responses: { total, internal, external },
-      staff,
       recent: recent.map(serializedAssessment),
+      topAssessments: topAssessments.map(serializedAssessment),
     });
   }),
 );
@@ -1014,30 +1023,235 @@ router.get(
   asyncHandler(async (req, res) => {
     const where =
       req.user.roles.name === "ADMIN" ? {} : { created_by: req.user.id };
-    const responses = await prisma.responses.findMany({
-      where: { assessments: where },
-      select: { submitted_at: true, respondent_type: true },
-    });
+    const now = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    const firstYear = now.getUTCFullYear() - 4;
+    const chartStart = new Date(Date.UTC(firstYear, 0, 1) - 7 * 60 * 60 * 1000);
+    const [responses, internalTotal, externalTotal] = await Promise.all([
+      prisma.responses.findMany({
+        where: { assessments: where, submitted_at: { gte: chartStart } },
+        select: { submitted_at: true },
+      }),
+      prisma.responses.count({
+        where: { respondent_type: "INTERNAL", assessments: where },
+      }),
+      prisma.responses.count({
+        where: { respondent_type: "EXTERNAL", assessments: where },
+      }),
+    ]);
     const daily = new Map(),
-      monthly = new Map();
+      monthly = new Map(),
+      yearly = new Map();
     for (const r of responses) {
-      const d = r.submitted_at.toISOString().slice(0, 10),
-        m = d.slice(0, 7);
+      const d = new Date(r.submitted_at.getTime() + 7 * 60 * 60 * 1000)
+          .toISOString()
+          .slice(0, 10),
+        m = d.slice(0, 7),
+        y = d.slice(0, 4);
       daily.set(d, (daily.get(d) || 0) + 1);
       monthly.set(m, (monthly.get(m) || 0) + 1);
+      yearly.set(y, (yearly.get(y) || 0) + 1);
     }
+    const dailyBuckets = Array.from({ length: 30 }, (_, index) => {
+      const date = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 29 + index),
+      ).toISOString().slice(0, 10);
+      return { date, count: daily.get(date) || 0 };
+    });
+    const monthlyBuckets = Array.from({ length: 12 }, (_, index) => {
+      const date = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11 + index, 1),
+      );
+      const month = date.toISOString().slice(0, 7);
+      return { month, count: monthly.get(month) || 0 };
+    });
+    const yearlyBuckets = Array.from({ length: 5 }, (_, index) => {
+      const year = String(now.getUTCFullYear() - 4 + index);
+      return { year, count: yearly.get(year) || 0 };
+    });
     ok(res, {
-      daily: [...daily].slice(-30).map(([date, count]) => ({ date, count })),
-      monthly: [...monthly]
-        .slice(-12)
-        .map(([month, count]) => ({ month, count })),
+      daily: dailyBuckets,
+      monthly: monthlyBuckets,
+      yearly: yearlyBuckets,
       respondents: {
-        internal: responses.filter((r) => r.respondent_type === "INTERNAL")
-          .length,
-        external: responses.filter((r) => r.respondent_type === "EXTERNAL")
-          .length,
+        internal: internalTotal,
+        external: externalTotal,
       },
     });
+  }),
+);
+router.get(
+  "/reports/pre-post",
+  roles("ADMIN", "STAFF"),
+  asyncHandler(async (req, res) => {
+    const { preTestId, postTestId } = parse(
+      z.object({ preTestId: z.string().uuid(), postTestId: z.string().uuid() }),
+      req.query,
+    );
+    const assessments = await prisma.assessments.findMany({
+      where: { id: { in: [preTestId, postTestId] } },
+      include: { _count: { select: { responses: true } } },
+    });
+    const preTest = assessments.find((item) => item.id === preTestId);
+    const postTest = assessments.find((item) => item.id === postTestId);
+    if (!preTest || !postTest) throw new HttpError(404, "ไม่พบแบบทดสอบที่เลือก");
+    for (const assessment of [preTest, postTest]) {
+      if (req.user.roles.name !== "ADMIN" && assessment.created_by !== req.user.id)
+        throw new HttpError(403, "ไม่มีสิทธิ์ดูรายงานแบบทดสอบนี้");
+    }
+    if (preTest.assessment_type !== "PRE_TEST" || postTest.assessment_type !== "POST_TEST")
+      throw new HttpError(400, "กรุณาเลือก Pre-test และ Post-test ให้ตรงประเภท");
+    const loadResponses = (assessmentId) =>
+      prisma.responses.findMany({
+        where: { assessment_id: assessmentId },
+        include: {
+          answers: {
+            include: {
+              answer_options: { include: { question_options: true } },
+            },
+          },
+        },
+      });
+    const [preResponses, postResponses] = await Promise.all([
+      loadResponses(preTestId),
+      loadResponses(postTestId),
+    ]);
+    const respondentKey = (response) => {
+      if (response.respondent_email?.trim())
+        return `email:${response.respondent_email.trim().toLowerCase()}`;
+      if (response.respondent_name?.trim())
+        return `name:${response.respondent_name.trim().toLowerCase()}`;
+      return null;
+    };
+    const calculateScore = (response) => {
+      const scores = response.answers
+        .map((answer) => {
+          if (answer.answer_number != null) return Number(answer.answer_number);
+          if (answer.answer_options.length)
+            return answer.answer_options.reduce(
+              (sum, option) => sum + option.question_options.score,
+              0,
+            );
+          return null;
+        })
+        .filter((score) => score != null);
+      return scores.length
+        ? scores.reduce((sum, score) => sum + score, 0) / scores.length
+        : null;
+    };
+    const summarize = (responses) => {
+      const scores = responses.map(calculateScore).filter((score) => score != null);
+      return {
+        responses: responses.length,
+        scoredResponses: scores.length,
+        averageScore: scores.length
+          ? scores.reduce((sum, score) => sum + score, 0) / scores.length
+          : null,
+      };
+    };
+    const postByRespondent = new Map(
+      postResponses
+        .map((response) => [respondentKey(response), response])
+        .filter(([key]) => key),
+    );
+    const pairedChanges = preResponses.flatMap((response) => {
+      const key = respondentKey(response);
+      const post = key ? postByRespondent.get(key) : null;
+      if (!post) return [];
+      const before = calculateScore(response);
+      const after = calculateScore(post);
+      return before == null || after == null ? [] : [after - before];
+    });
+    const averageChange = pairedChanges.length
+      ? pairedChanges.reduce((sum, change) => sum + change, 0) / pairedChanges.length
+      : null;
+    ok(res, {
+      preTest: { id: preTest.id, title: preTest.title, ...summarize(preResponses) },
+      postTest: { id: postTest.id, title: postTest.title, ...summarize(postResponses) },
+      pairedRespondents: pairedChanges.length,
+      averageChange,
+      improvedRespondents: pairedChanges.filter((change) => change > 0).length,
+      unchangedRespondents: pairedChanges.filter((change) => change === 0).length,
+    });
+  }),
+);
+router.get(
+  "/reports/summary/export",
+  roles("ADMIN", "STAFF"),
+  asyncHandler(async (req, res) => {
+    const { period } = parse(
+      z.object({ period: z.enum(["weekly", "monthly", "yearly"]) }),
+      req.query,
+    );
+    const bangkokNow = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    const year = bangkokNow.getUTCFullYear();
+    const month = bangkokNow.getUTCMonth();
+    const day = bangkokNow.getUTCDate();
+    let startLocal;
+    let endLocal;
+    if (period === "weekly") {
+      const mondayOffset = (bangkokNow.getUTCDay() + 6) % 7;
+      startLocal = new Date(Date.UTC(year, month, day - mondayOffset));
+      endLocal = new Date(startLocal.getTime() + 7 * 24 * 60 * 60 * 1000);
+    } else if (period === "monthly") {
+      startLocal = new Date(Date.UTC(year, month, 1));
+      endLocal = new Date(Date.UTC(year, month + 1, 1));
+    } else {
+      startLocal = new Date(Date.UTC(year, 0, 1));
+      endLocal = new Date(Date.UTC(year + 1, 0, 1));
+    }
+    const startAt = new Date(startLocal.getTime() - 7 * 60 * 60 * 1000);
+    const endAt = new Date(endLocal.getTime() - 7 * 60 * 60 * 1000);
+    const scope =
+      req.user.roles.name === "ADMIN" ? {} : { created_by: req.user.id };
+    const responses = await prisma.responses.findMany({
+      where: {
+        submitted_at: { gte: startAt, lt: endAt },
+        assessments: scope,
+      },
+      include: {
+        assessments: { select: { title: true, assessment_type: true } },
+      },
+      orderBy: { submitted_at: "asc" },
+    });
+    const rowsByGroup = new Map();
+    for (const response of responses) {
+      const date = new Date(response.submitted_at.getTime() + 7 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+      const assessment = response.assessments;
+      const key = `${date}\u0000${assessment.title}\u0000${assessment.assessment_type}`;
+      const row = rowsByGroup.get(key) || {
+        date,
+        title: assessment.title,
+        type: assessment.assessment_type,
+        total: 0,
+        internal: 0,
+        external: 0,
+      };
+      row.total += 1;
+      if (response.respondent_type === "INTERNAL") row.internal += 1;
+      if (response.respondent_type === "EXTERNAL") row.external += 1;
+      rowsByGroup.set(key, row);
+    }
+    const cell = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+    const csvRows = [
+      ["date", "assessment", "assessment_type", "responses", "internal", "external"],
+      ...[...rowsByGroup.values()].map((row) => [
+        row.date,
+        row.title,
+        row.type,
+        row.total,
+        row.internal,
+        row.external,
+      ]),
+    ];
+    const today = new Date(Date.now() + 7 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 10);
+    res
+      .type("text/csv; charset=utf-8")
+      .attachment(`assessment-report-${period}-${today}.csv`)
+      .send(`\uFEFF${csvRows.map((row) => row.map(cell).join(",")).join("\r\n")}`);
   }),
 );
 router.get(
@@ -1071,9 +1285,10 @@ router.get(
           numbers: [],
           options: {},
           texts: [],
+          answerCount: 0,
         };
+        item.answerCount += 1;
         if (
-          ans.questions.question_type === "RATING" &&
           ans.answer_number != null
         )
           item.numbers.push(Number(ans.answer_number));
@@ -1086,6 +1301,7 @@ router.get(
     const questions = [...byQuestion].map(([id, q]) => ({
       id,
       ...q,
+      answerCount: q.answerCount,
       average: q.numbers.length
         ? q.numbers.reduce((s, n) => s + n, 0) / q.numbers.length
         : null,
@@ -1094,8 +1310,38 @@ router.get(
     const avg = score.length
       ? score.reduce((s, q) => s + q.average, 0) / score.length
       : null;
+    const responseScore = (response) => {
+      const values = response.answers
+        .map((answer) => {
+          if (answer.answer_number != null) return Number(answer.answer_number);
+          if (answer.answer_options.length)
+            return answer.answer_options.reduce(
+              (sum, option) => sum + option.question_options.score,
+              0,
+            );
+          return null;
+        })
+        .filter((value) => value != null);
+      return values.length
+        ? values.reduce((sum, value) => sum + value, 0) / values.length
+        : null;
+    };
+    const scoredResponses = responses
+      .map((response) => responseScore(response))
+      .filter((value) => value != null);
+    const timeline = new Map();
+    for (const response of responses) {
+      const date = new Date(response.submitted_at.getTime() + 7 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+      timeline.set(date, (timeline.get(date) || 0) + 1);
+    }
     ok(res, {
-      assessment: { id: a.id, title: a.title },
+      assessment: {
+        id: a.id,
+        title: a.title,
+        assessmentType: a.assessment_type || "GENERAL",
+      },
       summary: {
         total: responses.length,
         internal: responses.filter((r) => r.respondent_type === "INTERNAL")
@@ -1103,12 +1349,21 @@ router.get(
         external: responses.filter((r) => r.respondent_type === "EXTERNAL")
           .length,
         average: avg,
+        averageScore: scoredResponses.length
+          ? scoredResponses.reduce((sum, value) => sum + value, 0) /
+            scoredResponses.length
+          : null,
+        scoredResponses: scoredResponses.length,
       },
+      timeline: [...timeline]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([date, count]) => ({ date, count })),
       questions,
       responses: responses.map((r) => ({
         id: r.id,
         type: r.respondent_type,
         submittedAt: r.submitted_at,
+        score: responseScore(r),
         answers: r.answers.map((x) => ({
           question: x.questions.question_text,
           text: x.answer_text,
